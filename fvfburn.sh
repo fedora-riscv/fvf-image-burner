@@ -17,39 +17,37 @@ check_dependencies() {
     done
 }
 
-user_interface() {
+get_image_option() {
     echo "============================================"
     echo "            FVF Image Burner"
     echo "============================================"
     echo "Choose image source:"
     echo "1. Use local image"
     echo "2. Download from images.fedoravforce.com"
-    read -p "Enter your choice (1/2): " source_choice
+    read -p "Enter your choice (1/2): " image_option
 
-    case $source_choice in
-        1)
-            echo
-            echo "Enter the full path to your image file"
-            echo "Example: /home/user/images/system.img"
-            read -p "Image path: " image_path
-            
-            if [ ! -f "$image_path" ]; then
-                echo "Error: Image file not found at $image_path"
-                exit 1
-            fi
-            image_name=$(basename "$image_path")
-            prepare_image "$image_path"
-            ;;
-        2)
-            fetch_remote_images
-            ;;
-        *)
-            echo "Invalid choice. Operation cancelled."
-            exit 1
-            ;;
-    esac
+    # Validate input
+    if [[ ! "$image_option" =~ ^[1-2]$ ]]; then
+        echo "Error: Invalid option. Please select 1 or 2."
+        exit 1
+    fi
 
+    return $image_option
+}
+
+select_local_image() {
     echo
+    echo "Enter the full path to your image file"
+    echo "Example: /home/user/images/system.img"
+    read -p "Image path: " image_path
+    
+    if [ ! -f "$image_path" ]; then
+        echo "Error: Image file not found at $image_path"
+        exit 1
+    fi
+}
+
+select_device() {
     echo "============================================"
     echo "        Available Storage Devices"
     echo "============================================"
@@ -95,6 +93,25 @@ prepare_image() {
             if [[ "$base_name" != *.img && "$base_name" != *.raw ]]; then
                 echo "Error: Compressed file must contain a .img or .raw file"
                 exit 1
+            fi
+            
+            # Check available space for gzip files only
+            # zstd cannot get decompressed size directly
+            if [[ "$input_path" == *.gz ]]; then
+                local target_dir=$(dirname "$base_name")
+                local needed_space=$(gzip -l "$input_path" | awk 'NR==2 {print $2}')
+                local available_space=$(df -B1 "$target_dir" | awk 'NR==2 {print $4}')
+                
+                if [ "$available_space" -lt "$needed_space" ]; then
+                    echo "Warning: Insufficient disk space for decompression"
+                    echo "Space needed: $(numfmt --to=iec-i --suffix=B $needed_space)"
+                    echo "Available space: $(numfmt --to=iec-i --suffix=B $available_space)"
+                    read -p "Continue anyway? (y/n): " confirm
+                    if [ "$confirm" != "y" ]; then
+                        echo "Operation cancelled."
+                        exit 1
+                    fi
+                fi
             fi
             
             echo "Decompressing to: $base_name"
@@ -254,7 +271,6 @@ download_image() {
     image_path="$download_path/$image_name"
 }
 
-# Helper function, called by user_interface
 fetch_remote_images() {
     echo "============================================"
     echo "        Available Remote Images"
@@ -298,7 +314,6 @@ fetch_remote_images() {
         image_url="${links[$image_number]}"
         
         download_image "$image_url"
-        return 0
     else
         echo "Error: Invalid selection. Please choose a number between 1 and ${#links[@]}"
         exit 1
@@ -307,8 +322,17 @@ fetch_remote_images() {
 
 main() {
     check_dependencies
-    user_interface
+    image_option=$(get_image_option)
+    case $image_option in
+        1)
+            select_local_image
+            ;;
+        2)
+            fetch_remote_images
+            ;;
+    esac
     prepare_image
+    select_device
     write_image
     cleanup_files
     echo "Done."
