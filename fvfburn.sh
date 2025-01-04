@@ -4,6 +4,7 @@
 # image_path    - Full path to the image file being used
 # zip_path      - Path to original compressed file (if any)
 # target_device - Device path for writing (e.g., /dev/sda)
+# image_option  - 1 for local image, 2 for remote image
 
 REQUIRED_COMMANDS=("dd" "wget" "curl" "jq" "unzstd" "gunzip")
 API_URL="https://api.fedoravforce.org/stats/"
@@ -31,8 +32,6 @@ get_image_option() {
         echo "Error: Invalid option. Please select 1 or 2."
         exit 1
     fi
-
-    return $image_option
 }
 
 select_local_image() {
@@ -97,22 +96,23 @@ prepare_image() {
             
             # Check available space for gzip files only
             # zstd cannot get decompressed size directly
-            if [[ "$input_path" == *.gz ]]; then
-                local target_dir=$(dirname "$base_name")
-                local needed_space=$(gzip -l "$input_path" | awk 'NR==2 {print $2}')
-                local available_space=$(df -B1 "$target_dir" | awk 'NR==2 {print $4}')
+            # TODO: slow
+            # if [[ "$input_path" == *.gz ]]; then
+            #     local target_dir=$(dirname "$base_name")
+            #     local needed_space=$(gzip -l "$input_path" | awk 'NR==2 {print $2}')
+            #     local available_space=$(df -B1 "$target_dir" | awk 'NR==2 {print $4}')
                 
-                if [ "$available_space" -lt "$needed_space" ]; then
-                    echo "Warning: Insufficient disk space for decompression"
-                    echo "Space needed: $(numfmt --to=iec-i --suffix=B $needed_space)"
-                    echo "Available space: $(numfmt --to=iec-i --suffix=B $available_space)"
-                    read -p "Continue anyway? (y/n): " confirm
-                    if [ "$confirm" != "y" ]; then
-                        echo "Operation cancelled."
-                        exit 1
-                    fi
-                fi
-            fi
+            #     if [ "$available_space" -lt "$needed_space" ]; then
+            #         echo "Warning: Insufficient disk space for decompression"
+            #         echo "Space needed: $(numfmt --to=iec-i --suffix=B $needed_space)"
+            #         echo "Available space: $(numfmt --to=iec-i --suffix=B $available_space)"
+            #         read -p "Continue anyway? (y/n): " confirm
+            #         if [ "$confirm" != "y" ]; then
+            #             echo "Operation cancelled."
+            #             exit 1
+            #         fi
+            #     fi
+            # fi
             
             echo "Decompressing to: $base_name"
             if [[ "$input_path" == *.gz ]]; then
@@ -167,14 +167,21 @@ write_image() {
 
     echo "Wiping existing filesystem signatures..."
     if ! sudo wipefs -a "$target_device"; then
-        echo "Error: Failed to wipe filesystem signatures."
-        exit 1
+        read -p "Force wipe with -f? (y/n): " confirm
+        if [ "$confirm" != "y" ]; then
+            echo "Operation cancelled."
+            exit 1
+        fi
+        echo "Force wiping existing filesystem signatures..."
+        if ! sudo wipefs -af "$target_device"; then
+            echo "Error: Failed to wipe filesystem signatures."
+            exit 1
+        fi
     fi
     echo "Device wiped successfully."
     
     # Step 2: burn image
     echo
-    echo "Step 2: Burn image to device"
     echo "Command to execute:"
     echo "  sudo dd if=$image_path of=$target_device bs=4M status=progress"
     echo
@@ -322,7 +329,7 @@ fetch_remote_images() {
 
 main() {
     check_dependencies
-    image_option=$(get_image_option)
+    get_image_option
     case $image_option in
         1)
             select_local_image
