@@ -6,7 +6,7 @@
 # target_device - Device path for writing (e.g., /dev/sda)
 # image_option  - 1 for local image, 2 for remote image
 
-REQUIRED_COMMANDS=("dd" "wget" "curl" "jq" "unzstd" "gunzip" "parted" "growpart" "e2fsck" "resize2fs")
+REQUIRED_COMMANDS=("dd" "wget" "curl" "jq" "unzstd" "gunzip" "parted" "growpart" "e2fsck" "resize2fs" "tune2fs" "uuidgen" "blkid")
 API_URL="https://api.fedoravforce.org/stats/"
 
 check_dependencies() {
