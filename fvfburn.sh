@@ -6,7 +6,7 @@
 # target_device - Device path for writing (e.g., /dev/sda)
 # image_option  - 1 for local image, 2 for remote image
 
-REQUIRED_COMMANDS=("dd" "wget" "curl" "jq" "unzstd" "gunzip")
+REQUIRED_COMMANDS=("dd" "wget" "curl" "jq" "unzstd" "gunzip" "parted" "growpart" "e2fsck" "resize2fs")
 API_URL="https://api.fedoravforce.org/stats/"
 
 check_dependencies() {
@@ -200,6 +200,58 @@ write_image() {
     sync  # Ensure all data is written to disk
 }
 
+expand_partition() {
+    echo "============================================"
+    echo "          Partition Expansion"
+    echo "============================================"
+    
+    echo "Current partition layout:"
+    if ! sudo parted -s "$target_device" print free; then
+        echo "Error: Failed to read partition table"
+        return 1
+    fi
+
+    read -p "Do you want to expand a partition to use all of the space? (y/n): " expand_confirm
+    if [ "$expand_confirm" != "y" ]; then
+        return 0
+    fi
+
+    read -p "Enter the partition number to expand: " part_num
+
+    echo "This will expand partition $part_num on $target_device"
+    read -p "Continue? (y/n): " confirm
+    if [ "$confirm" != "y" ]; then
+        return 0
+    fi
+
+    echo "Expanding partition..."
+    echo "Command to execute:"
+    echo "  sudo growpart $target_device $part_num"
+    if ! sudo growpart "$target_device" "$part_num"; then
+        echo "Error: Failed to expand partition"
+        return 1
+    fi
+
+    local partition="${target_device}${part_num}"
+    echo "Checking filesystem..."
+    echo "Command to execute:"
+    echo "  sudo e2fsck -f $partition"
+    if ! sudo e2fsck -f "$partition"; then
+        echo "Error: Filesystem check failed"
+        return 1
+    fi
+
+    echo "Resizing filesystem..."
+    echo "Command to execute:"
+    echo "  sudo resize2fs $partition"
+    if ! sudo resize2fs "$partition"; then
+        echo "Error: Failed to resize filesystem"
+        return 1
+    fi
+
+    echo "Partition expanded successfully"
+}
+
 cleanup_files() {
     echo "============================================"
     echo "              Cleanup"
@@ -341,6 +393,7 @@ main() {
     prepare_image
     select_device
     write_image
+    expand_partition
     cleanup_files
     echo "Done."
 }
