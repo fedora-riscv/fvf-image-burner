@@ -379,6 +379,100 @@ fetch_remote_images() {
     fi
 }
 
+regenerate_uuid() {
+    echo "============================================"
+    echo "          UUID Regeneration"
+    echo "============================================"
+    
+    echo "Detecting partitions..."
+    
+    # Find bootfs and rootfs partitions and their UUIDs
+    bootfs_part=$(sudo blkid "${target_device}"* | grep 'LABEL="bootfs"' | cut -d: -f1)
+    if [ -z "$bootfs_part" ]; then
+        echo "Error: bootfs partition not found"
+        return 1
+    fi
+    echo "bootfs partition: $bootfs_part"
+    bootfs_uuid_old=$(sudo blkid -s UUID "$bootfs_part" | cut -d'"' -f2)
+    
+    rootfs_part=$(sudo blkid "${target_device}"* | grep 'LABEL="rootfs"' | cut -d: -f1)
+    if [ -z "$rootfs_part" ]; then
+        echo "Error: rootfs partition not found"
+        return 1
+    fi
+    echo "rootfs partition: $rootfs_part"
+    echo
+    rootfs_uuid_old=$(sudo blkid -s UUID "$rootfs_part" | cut -d'"' -f2)
+
+    bootfs_uuid_new=$(uuidgen)
+    rootfs_uuid_new=$(uuidgen)
+    
+    echo "Current UUIDs:"
+    echo "bootfs: $bootfs_uuid_old"
+    echo "rootfs: $rootfs_uuid_old"
+    echo
+    echo "New UUIDs:"
+    echo "bootfs: $bootfs_uuid_new"
+    echo "rootfs: $rootfs_uuid_new"
+    echo
+    
+    tmp_boot=$(mktemp -d)
+    tmp_root=$(mktemp -d)
+    
+    echo "Mounting bootfs partition..."
+    if ! sudo mount "$bootfs_part" "$tmp_boot"; then
+        echo "Error: Failed to mount bootfs partition"
+        rm -rf "$tmp_boot" "$tmp_root"
+        return 1
+    fi
+
+    echo "Mounting rootfs partition..."
+    if ! sudo mount "$rootfs_part" "$tmp_root"; then
+        echo "Error: Failed to mount rootfs partition"
+        sudo umount "$tmp_boot"
+        rm -rf "$tmp_boot" "$tmp_root"
+        return 1
+    fi
+    
+    # Update /boot/extlinux/extlinux.conf
+    if [ -f "$tmp_boot/extlinux/extlinux.conf" ]; then
+        echo "Updating extlinux.conf..."
+        sudo sed -i "s/$bootfs_uuid_old/$bootfs_uuid_new/g" "$tmp_boot/extlinux/extlinux.conf"
+        sudo sed -i "s/$rootfs_uuid_old/$rootfs_uuid_new/g" "$tmp_boot/extlinux/extlinux.conf"
+    fi
+    
+    # Update grub config in /boot/loader/entries/
+    if [ -d "$tmp_boot/loader/entries" ]; then
+        grub_conf_file=$(ls "$tmp_boot/loader/entries/"*.conf 2>/dev/null | head -n1)
+        if [ -n "$grub_conf_file" ]; then
+            echo "Updating grub config..."
+            sudo sed -i "s/$bootfs_uuid_old/$bootfs_uuid_new/g" "$grub_conf_file"
+            sudo sed -i "s/$rootfs_uuid_old/$rootfs_uuid_new/g" "$grub_conf_file"
+        fi
+    fi
+    
+    # Update /etc/fstab
+    if [ -f "$tmp_root/etc/fstab" ]; then
+        echo "Updating fstab..."
+        sudo sed -i "s/$bootfs_uuid_old/$bootfs_uuid_new/g" "$tmp_root/etc/fstab"
+        sudo sed -i "s/$rootfs_uuid_old/$rootfs_uuid_new/g" "$tmp_root/etc/fstab"
+    fi
+    
+    echo "Setting new UUIDs..."
+    echo "Command to execute:"
+    echo "  sudo tune2fs -U $bootfs_uuid_new $bootfs_part"
+    echo "  sudo tune2fs -U $rootfs_uuid_new $rootfs_part"
+    sudo tune2fs -U "$bootfs_uuid_new" "$bootfs_part"
+    sudo tune2fs -U "$rootfs_uuid_new" "$rootfs_part"
+    
+    echo "Cleaning up..."
+    sudo umount "$tmp_boot"
+    sudo umount "$tmp_root"
+    rm -rf "$tmp_boot" "$tmp_root"
+    
+    echo "UUID regeneration complete"
+}
+
 main() {
     check_dependencies
     get_image_option
@@ -393,6 +487,7 @@ main() {
     prepare_image
     select_device
     write_image
+    regenerate_uuid
     expand_partition
     cleanup_files
     echo "Done."
