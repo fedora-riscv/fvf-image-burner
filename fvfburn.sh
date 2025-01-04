@@ -9,6 +9,8 @@
 REQUIRED_COMMANDS=("dd" "wget" "curl" "jq" "unzstd" "gunzip" "parted" "growpart" "e2fsck" "resize2fs" "tune2fs" "uuidgen" "blkid")
 API_URL="https://api.fedoravforce.org/stats/"
 
+RECOMMENDED_SPACE=19327352832 # 18GiB
+
 check_dependencies() {
     for cmd in "${REQUIRED_COMMANDS[@]}"; do
         if ! command -v $cmd &>/dev/null; then
@@ -113,6 +115,20 @@ prepare_image() {
             #         fi
             #     fi
             # fi
+
+            # gzip -l is slow, so
+            # check if disk space has at least 18GB
+            local available_space=$(df -B1 "$target_dir" | awk 'NR==2 {print $4}')
+            if [ "$available_space" -lt "$RECOMMENDED_SPACE" ]; then
+                echo "You might not have enough disk space for decompression"
+                echo "Space recommended: $(numfmt --to=iec-i --suffix=B $RECOMMENDED_SPACE)"
+                echo "Available space: $(numfmt --to=iec-i --suffix=B $available_space)"
+                read -p "Continue anyway? (y/n): " confirm
+                if [ "$confirm" != "y" ]; then
+                    echo "Operation cancelled."
+                    exit 1
+                fi
+            fi
             
             echo "Decompressing to: $base_name"
             if [[ "$input_path" == *.gz ]]; then
