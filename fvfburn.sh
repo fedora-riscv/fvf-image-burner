@@ -5,19 +5,68 @@
 # zip_path      - Path to original compressed file (if any)
 # target_device - Device path for writing (e.g., /dev/sda)
 # image_option  - 1 for local image, 2 for remote image
+# target_option - 1 for device, 2 for file
 
-REQUIRED_COMMANDS=("dd" "wget" "curl" "jq" "unzstd" "gunzip" "parted" "growpart" "e2fsck" "resize2fs" "tune2fs" "uuidgen" "blkid")
+REQUIRED_COMMANDS=("dd" "wget" "curl" "jq" "unzstd" "gunzip" "parted" "growpart" "e2fsck" "resize2fs" "tune2fs" "uuidgen" "blkid" "tr" "lsblk" "mlabel")
 API_URL="https://api.fedoravforce.org/stats/"
 
 RECOMMENDED_SPACE=19327352832 # 18GiB
+# GUIDs, see https://en.wikipedia.org/wiki/GUID_Partition_Table
+ROOTFS_PART_TYPE="0fc63daf-8483-4772-8e79-3d69d8477de4"
+BOOTFS_PART_TYPE="bc13c2ff-59e6-4262-a352-b275fd6f7172"
+EFI_PART_TYPE="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 
 check_dependencies() {
+    local missing_commands=()
+    local package_manager=""
+    local install_cmd=""
+
+    # Detect package manager
+    if command -v dnf &>/dev/null; then
+        package_manager="dnf"
+        install_cmd="sudo dnf install"
+    elif command -v apt &>/dev/null; then
+        package_manager="apt"
+        install_cmd="sudo apt install"
+    fi
+
     for cmd in "${REQUIRED_COMMANDS[@]}"; do
-        if ! command -v $cmd &>/dev/null; then
-            echo "Error: $cmd is not installed. Please install it first."
-            exit 1
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_commands+=("$cmd")
         fi
     done
+
+    if [ ${#missing_commands[@]} -ne 0 ]; then
+        echo "The following commands are missing:"
+        printf '%s\n' "${missing_commands[@]}"
+        
+        if [ -z "$package_manager" ]; then
+            echo "Error: Could not detect package manager. Please install the missing packages manually."
+            exit 1
+        fi
+
+        echo "Would you like to install them using $package_manager? (y/n)"
+        read -r confirm
+        if [ "$confirm" = "y" ]; then
+            echo "Do you want to install them with -y? (y/n)"
+            read -r confirm
+            if [ "$confirm" = "y" ]; then
+                install_cmd="$install_cmd -y"
+            fi
+            for cmd in "${missing_commands[@]}"; do
+                echo "Command to execute:"
+                echo "  $install_cmd $cmd"
+                if ! $install_cmd "$cmd"; then
+                    echo "Error: Failed to install $cmd"
+                    exit 1
+                fi
+            done
+            echo "All dependencies installed successfully."
+        else
+            echo "Please install the missing dependencies manually."
+            exit 1
+        fi
+    fi
 }
 
 get_image_option() {
@@ -31,6 +80,21 @@ get_image_option() {
 
     # Validate input
     if [[ ! "$image_option" =~ ^[1-2]$ ]]; then
+        echo "Error: Invalid option. Please select 1 or 2."
+        exit 1
+    fi
+}
+
+get_target_option() {
+    echo "============================================"
+    echo "        Target Selection"
+    echo "============================================"
+    echo "1. Write to a device (e.g., /dev/sda)"
+    echo "2. Write to a file (e.g., image.img)"
+    read -p "Enter your choice (1/2): " target_option
+
+    # Validate input
+    if [[ ! "$target_option" =~ ^[1-2]$ ]]; then
         echo "Error: Invalid option. Please select 1 or 2."
         exit 1
     fi
@@ -81,6 +145,63 @@ select_device() {
     fi
 }
 
+check_mountpoint() {
+    # Get all mount points
+    mount_points=$(mount | grep "$target_device" | awk '{print $3}')
+
+    # If there are any mount points
+    if [ -n "$mount_points" ]; then
+        echo "$target_device is mounted at the following locations:"
+        echo "$mount_points"
+        
+        # Loop through each mount point
+        for mount_point in $mount_points; do
+            read -p "Do you want to unmount $mount_point? (y/n): " choice
+            if [[ "$choice" =~ ^[Yy]$ ]]; then
+                # Try to unmount
+                sudo umount "$mount_point"
+                if [ $? -eq 0 ]; then
+                    echo "$mount_point has been successfully unmounted"
+                else
+                    echo "Failed to unmount $mount_point, exiting the script"
+                    exit 1
+                fi
+            else
+                echo "$mount_point is still mounted, operation cannot continue, exiting the script."
+                exit 1
+            fi
+        done
+    else
+        echo "$target_device is not mounted"
+    fi
+}
+
+
+select_file() {
+    echo "============================================"
+    echo "        Select Image File"
+    echo "============================================"
+    read -p "Enter output file path (e.g., ./image.img): " file_path
+    
+    # if not exists, create it
+    if [ ! -f "$file_path" ]; then
+        read -p "File does not exist, create it? (y/n): " confirm
+        if [ "$confirm" != "y" ]; then
+            echo "Operation cancelled."
+            exit 1
+        fi
+
+        read -p "Enter image size (MB): " image_size
+        dd if=/dev/zero of="$file_path" bs=1M count="$image_size" status=progress
+        if [ $? -ne 0 ]; then
+            echo "Error: Failed to create image file."
+            exit 1
+        fi
+
+        echo "Image file created successfully."
+    fi
+}
+
 prepare_image() {
     echo "============================================"
     echo "          Image Preparation"
@@ -118,6 +239,7 @@ prepare_image() {
 
             # gzip -l is slow, so
             # check if disk space has at least 18GB
+            local target_dir=$(dirname "$base_name")
             local available_space=$(df -B1 "$target_dir" | awk 'NR==2 {print $4}')
             if [ "$available_space" -lt "$RECOMMENDED_SPACE" ]; then
                 echo "You might not have enough disk space for decompression"
@@ -197,16 +319,6 @@ write_image() {
     echo "Device wiped successfully."
     
     # Step 2: burn image
-    echo
-    echo "Command to execute:"
-    echo "  sudo dd if=$image_path of=$target_device bs=4M status=progress"
-    echo
-    read -p "Continue with burning image? (yes/no): " confirm
-    if [ "$confirm" != "yes" ]; then
-        echo "Operation cancelled."
-        exit 1
-    fi
-
     echo "Burning image to device..."
     if ! sudo dd if="$image_path" of="$target_device" bs=4M status=progress; then
         echo "Write failed. Please check the image or device."
@@ -214,6 +326,24 @@ write_image() {
     fi
     echo "Image burned successfully."
     sync  # Ensure all data is written to disk
+}
+
+write_image_to_file() {
+    echo "============================================"
+    echo "           Burn Image to File"
+    echo "============================================"
+    
+    if ! sudo dd if="$image_path" of="$file_path" bs=4M status=progress; then
+        echo "Write failed. Please check the image or file."
+        exit 1
+    fi
+    echo "Image burned successfully."
+    sync  # Ensure all data is written to disk
+
+    # create loop device
+    target_device=$(sudo losetup -Pf --show "$file_path")
+    echo "Loop device created: $target_device"
+    # clean up later
 }
 
 expand_partition() {
@@ -248,7 +378,17 @@ expand_partition() {
         return 1
     fi
 
-    local partition="${target_device}${part_num}"
+    # if device name ends with a number, add a 'p' to the partition number
+    # sda partition 1 -> sda1
+    # nvme0n1 partition 1 -> nvme0n1p1
+
+    local partition
+    if [[ "$target_device" =~ [0-9]$ ]]; then
+        partition="${target_device}p${part_num}"
+    else
+        partition="${target_device}${part_num}"
+    fi
+    
     echo "Checking filesystem..."
     echo "Command to execute:"
     echo "  sudo e2fsck -f $partition"
@@ -286,6 +426,14 @@ cleanup_files() {
         rm "$image_path"
         echo "Image file removed."
     fi
+}
+
+cleanup_loop_device() {
+    echo "============================================"
+    echo "              Cleanup Loop Device"
+    echo "============================================"
+    
+    sudo losetup -d "$target_device"
 }
 
 # Helper function, called by fetch_remote_images
@@ -395,34 +543,93 @@ fetch_remote_images() {
     fi
 }
 
+# helper function
+is_fat32() {
+    local device="$1"
+    local fstype=$(lsblk -o FSTYPE "$device" -npl | head -n1)
+    if [ "$fstype" = "fat32" ] || [ "$fstype" = "vfat" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# helper function
+is_ext4() {
+    local device="$1"
+    local fstype=$(lsblk -o FSTYPE "$device" -npl | head -n1)
+    if [ "$fstype" = "ext4" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# helper function, called by regenerate_uuid
+# generate 32-bit UUID for fat32
+# and use uuidgen for ext4
+generate_uuid() {
+    local device="$1"
+    if is_fat32 "$device"; then
+        uuid=$(hexdump -n 4 -e '1/4 "%08x"' /dev/urandom | tr 'a-f' 'A-F')
+        echo "$uuid"
+    elif is_ext4 "$device"; then
+        uuid=$(uuidgen)
+        echo "$uuid"
+    else
+        fstype=$(lsblk -o FSTYPE "$device" -npl | head -n1)
+        echo "Error: Unsupported filesystem type: $fstype"
+        return 1
+    fi
+}
+
 regenerate_uuid() {
     echo "============================================"
     echo "          UUID Regeneration"
     echo "============================================"
     
     echo "Detecting partitions..."
+
+    partition_table_type=$(sudo lsblk -o PTTYPE "$target_device" -npl | head -n1)
+    echo "Partition table type: $partition_table_type"
     
-    # Find bootfs and rootfs partitions and their UUIDs
-    bootfs_part=$(sudo blkid "${target_device}"* | grep 'LABEL="bootfs"' | cut -d: -f1)
+    # Find bootfs and rootfs partitions
+    if [ "$partition_table_type" = "gpt" ]; then
+        # Search for the last partition matching the GUID (PARTTYPE)
+        bootfs_part=$(sudo lsblk "${target_device}" -o NAME,PARTTYPE -npl | grep "$BOOTFS_PART_TYPE" | tail -n1 | cut -d' ' -f1)
+        rootfs_part=$(sudo lsblk "${target_device}" -o NAME,PARTTYPE -npl | grep "$ROOTFS_PART_TYPE" | tail -n1 | cut -d' ' -f1)
+        efi_part=$(sudo lsblk "${target_device}" -o NAME,PARTTYPE -npl | grep "$EFI_PART_TYPE" | tail -n1 | cut -d' ' -f1)
+    else # msdos(mbr)
+        # See if label contains "boot" or "root"
+        bootfs_part=$(sudo lsblk "${target_device}" -o NAME,LABEL -npl | grep "boot" | cut -d' ' -f1)
+        rootfs_part=$(sudo lsblk "${target_device}" -o NAME,LABEL -npl | grep "root" | cut -d' ' -f1)
+    fi
+
     if [ -z "$bootfs_part" ]; then
         echo "Error: bootfs partition not found"
         return 1
     fi
-    echo "bootfs partition: $bootfs_part"
+    echo "bootfs partition: $(sudo lsblk "${bootfs_part}" -o NAME,LABEL -pP)"
     bootfs_uuid_old=$(sudo blkid -s UUID "$bootfs_part" | cut -d'"' -f2)
     
-    rootfs_part=$(sudo blkid "${target_device}"* | grep 'LABEL="rootfs"' | cut -d: -f1)
     if [ -z "$rootfs_part" ]; then
         echo "Error: rootfs partition not found"
         return 1
     fi
-    echo "rootfs partition: $rootfs_part"
-    echo
+    echo "rootfs partition: $(sudo lsblk "${rootfs_part}" -o NAME,LABEL -pP)"
     rootfs_uuid_old=$(sudo blkid -s UUID "$rootfs_part" | cut -d'"' -f2)
 
-    bootfs_uuid_new=$(uuidgen)
-    rootfs_uuid_new=$(uuidgen)
-    
+    bootfs_uuid_new=$(generate_uuid "$bootfs_part")
+    if [ $? -eq 1 ]; then
+        echo "Error: Failed to generate UUID for bootfs partition"
+        return 1
+    fi
+    rootfs_uuid_new=$(generate_uuid "$rootfs_part")
+    if [ $? -eq 1 ]; then
+        echo "Error: Failed to generate UUID for rootfs partition"
+        return 1
+    fi
+
     echo "Current UUIDs:"
     echo "bootfs: $bootfs_uuid_old"
     echo "rootfs: $rootfs_uuid_old"
@@ -449,6 +656,35 @@ regenerate_uuid() {
         rm -rf "$tmp_boot" "$tmp_root"
         return 1
     fi
+
+    if [ -n "$efi_part" ]; then
+        efi_uuid_old=$(sudo blkid -s UUID "$efi_part" | cut -d'"' -f2)
+        efi_uuid_new=$(generate_uuid "$efi_part")
+        echo "EFI Part Found!"
+        echo "EFI Current UUID: $efi_uuid_old"
+        echo "EFI New UUID: $efi_uuid_new"
+        tmp_efi=$(mktemp -d)
+        if ! sudo mount "$efi_part" "$tmp_efi"; then
+            echo "Error: Failed to mount bootfs partition"
+            rm -rf "$tmp_boot" "$tmp_root" "$tmp_efi"
+            return 1
+        fi
+
+        if [ -f "$tmp_efi/EFI/fedora/grub.cfg" ]; then
+            echo "Updating grub.cfg..."
+            sudo sed -i "s/$bootfs_uuid_old/$bootfs_uuid_new/g" "$tmp_efi/EFI/fedora/grub.cfg"
+            sudo sed -i "s/$rootfs_uuid_old/$rootfs_uuid_new/g" "$tmp_efi/EFI/fedora/grub.cfg"
+            sudo sed -i "s/$efi_uuid_old/${efi_uuid_new:0:4}-${efi_uuid_new:4}/g" "$tmp_efi/EFI/fedora/grub.cfg"
+        fi
+
+        sudo umount "$tmp_efi"
+        rm -rf "$tmp_efi"
+
+        echo "Setting EFI Partition UUID..."
+        echo "Command to execute:"
+        echo "  sudo mlabel -i $efi_part -N $efi_uuid_new"
+        sudo mlabel -i "$efi_part" -N "$efi_uuid_new"
+    fi
     
     # Update /boot/extlinux/extlinux.conf
     if [ -f "$tmp_boot/extlinux/extlinux.conf" ]; then
@@ -459,7 +695,7 @@ regenerate_uuid() {
     
     # Update grub config in /boot/loader/entries/
     if [ -d "$tmp_boot/loader/entries" ]; then
-        grub_conf_file=$(ls "$tmp_boot/loader/entries/"*.conf 2>/dev/null | head -n1)
+        grub_conf_file=$(sudo find "$tmp_boot/loader/entries/" -maxdepth 1 -name "*.conf" 2>/dev/null | head -n1)
         if [ -n "$grub_conf_file" ]; then
             echo "Updating grub config..."
             sudo sed -i "s/$bootfs_uuid_old/$bootfs_uuid_new/g" "$grub_conf_file"
@@ -472,20 +708,28 @@ regenerate_uuid() {
         echo "Updating fstab..."
         sudo sed -i "s/$bootfs_uuid_old/$bootfs_uuid_new/g" "$tmp_root/etc/fstab"
         sudo sed -i "s/$rootfs_uuid_old/$rootfs_uuid_new/g" "$tmp_root/etc/fstab"
+        
+        # if efi part exist
+        if [ -n "$efi_part" ]; then
+            sudo sed -i "s/$efi_uuid_old/${efi_uuid_new:0:4}-${efi_uuid_new:4}/g" "$tmp_root/etc/fstab"
+        fi
+
     fi
     
     echo "Setting new UUIDs..."
     echo "Command to execute:"
     echo "  sudo tune2fs -U $bootfs_uuid_new $bootfs_part"
-    echo "  sudo tune2fs -U $rootfs_uuid_new $rootfs_part"
     sudo tune2fs -U "$bootfs_uuid_new" "$bootfs_part"
+
+    echo "Command to execute:"
+    echo "  sudo tune2fs -U $rootfs_uuid_new $rootfs_part"
     sudo tune2fs -U "$rootfs_uuid_new" "$rootfs_part"
     
     echo "Cleaning up..."
     sudo umount "$tmp_boot"
     sudo umount "$tmp_root"
     rm -rf "$tmp_boot" "$tmp_root"
-    
+
     echo "UUID regeneration complete"
 }
 
@@ -501,11 +745,24 @@ main() {
             ;;
     esac
     prepare_image
-    select_device
-    write_image
+    get_target_option
+    case $target_option in
+        1)
+            select_device
+            check_mountpoint
+            write_image
+            ;;
+        2)
+            select_file
+            write_image_to_file
+            ;;
+    esac
     regenerate_uuid
     expand_partition
     cleanup_files
+    if [ "$target_option" = "2" ]; then
+        cleanup_loop_device
+    fi
     echo "Done."
 }
 main
