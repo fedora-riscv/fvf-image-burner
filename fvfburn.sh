@@ -16,6 +16,31 @@ ROOTFS_PART_TYPE="0fc63daf-8483-4772-8e79-3d69d8477de4"
 BOOTFS_PART_TYPE="bc13c2ff-59e6-4262-a352-b275fd6f7172"
 EFI_PART_TYPE="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 
+# Map commands to package names
+declare -A DNF_PACKAGES=(
+    ["growpart"]="cloud-utils-growpart"
+    ["mlabel"]="mtools"
+    ["unzstd"]="zstd"
+    ["e2fsck"]="e2fsprogs"
+    ["resize2fs"]="e2fsprogs"
+    ["tune2fs"]="e2fsprogs"
+    ["blkid"]="util-linux"
+    ["tr"]="coreutils"
+    ["lsblk"]="util-linux"
+)
+
+declare -A APT_PACKAGES=(
+    ["growpart"]="cloud-utils"
+    ["mlabel"]="mtools"
+    ["unzstd"]="zstd"
+    ["e2fsck"]="e2fsprogs"
+    ["resize2fs"]="e2fsprogs"
+    ["tune2fs"]="e2fsprogs"
+    ["blkid"]="util-linux"
+    ["tr"]="coreutils"
+    ["lsblk"]="util-linux"
+)
+
 check_dependencies() {
     local missing_commands=()
     local package_manager=""
@@ -53,11 +78,27 @@ check_dependencies() {
             if [ "$confirm" = "y" ]; then
                 install_cmd="$install_cmd -y"
             fi
+
             for cmd in "${missing_commands[@]}"; do
+                local package_name
+                if [ "$package_manager" = "dnf" ]; then
+                    if [ -n "${DNF_PACKAGES[$cmd]}" ]; then
+                        package_name="${DNF_PACKAGES[$cmd]}"
+                    else
+                        package_name="$cmd"
+                    fi
+                elif [ "$package_manager" = "apt" ]; then
+                    if [ -n "${APT_PACKAGES[$cmd]}" ]; then
+                        package_name="${APT_PACKAGES[$cmd]}"
+                    else
+                        package_name="$cmd"
+                    fi
+                fi
+
                 echo "Command to execute:"
-                echo "  $install_cmd $cmd"
-                if ! $install_cmd "$cmd"; then
-                    echo "Error: Failed to install $cmd"
+                echo "  $install_cmd $package_name"
+                if ! $install_cmd "$package_name"; then
+                    echo "Error: Failed to install package for $cmd"
                     exit 1
                 fi
             done
