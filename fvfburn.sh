@@ -232,7 +232,28 @@ select_file() {
             exit 1
         fi
 
-        read -p "Enter image size (MB): " image_size
+        while true; do
+            read -p "Enter image size (MB): " image_size
+            
+            # Check available disk space
+            target_dir=$(dirname "$file_path")
+            available_space=$(($(df -BM "$target_dir" | awk 'NR==2 {print $4}' | sed 's/M//')))
+            
+            if [ "$image_size" -gt "$available_space" ]; then
+                echo "Warning: You might not have enough disk space"
+                echo "Required: ${image_size}MB"
+                echo "Available: ${available_space}MB"
+                read -p "Continue anyway? (y/n): " force_continue
+                if [ "$force_continue" != "y" ]; then
+                    continue
+                fi
+            fi
+
+            # Space check passed or forced
+            break
+        done
+
+        echo "Creating image file of ${image_size}MB..."
         dd if=/dev/zero of="$file_path" bs=1M count="$image_size" status=progress
         if [ $? -ne 0 ]; then
             echo "Error: Failed to create image file."
@@ -332,6 +353,22 @@ write_image() {
     echo "WARNING: This will ERASE ALL DATA on $target_device!"
     echo "         This operation cannot be undone!"
     echo "--------------------------------------------"
+
+    # Check if device has enough space
+    local image_size=$(stat -L -c%s "$image_path")
+    local device_size=$(lsblk -b -dn -o SIZE "$target_device")
+    
+    if [ "$image_size" -gt "$device_size" ]; then
+        echo "Warning: Image size is larger than device"
+        echo "Image size: $(numfmt --to=iec-i --suffix=B $image_size)"
+        echo "Device size: $(numfmt --to=iec-i --suffix=B $device_size)"
+        read -p "Continue anyway? (y/n): " force_continue
+        if [ "$force_continue" != "y" ]; then
+            echo "Operation cancelled."
+            exit 1
+        fi
+        echo "Proceeding with write despite size mismatch..."
+    fi
     
     # Step 1: wipefs
     echo "Step 1: Wipe filesystem signatures"
@@ -374,6 +411,22 @@ write_image_to_file() {
     echo "           Burn Image to File"
     echo "============================================"
     
+    # Check if target file has enough space
+    local image_size=$(stat -L -c%s "$image_path")
+    local file_size=$(stat -L -c%s "$file_path")
+    
+    if [ "$image_size" -gt "$file_size" ]; then
+        echo "Warning: Image size is larger than target file"
+        echo "Image size: $(numfmt --to=iec-i --suffix=B $image_size)"
+        echo "File size: $(numfmt --to=iec-i --suffix=B $file_size)"
+        read -p "Continue anyway? (y/n): " force_continue
+        if [ "$force_continue" != "y" ]; then
+            echo "Operation cancelled."
+            exit 1
+        fi
+        echo "Proceeding with write despite size mismatch..."
+    fi
+    
     if ! sudo dd if="$image_path" of="$file_path" bs=4M status=progress; then
         echo "Write failed. Please check the image or file."
         exit 1
@@ -398,23 +451,61 @@ expand_partition() {
         return 1
     fi
 
-    read -p "Do you want to expand a partition to use all of the space? (y/n): " expand_confirm
+    read -p "Do you want to expand a partition? (y/n): " expand_confirm
     if [ "$expand_confirm" != "y" ]; then
         return 0
     fi
 
     read -p "Enter the partition number to expand: " part_num
 
-    echo "This will expand partition $part_num on $target_device"
+    # Get current partition info and disk size
+    local disk_end=$(sudo parted -s "$target_device" unit MB print | grep "^Disk" | cut -d' ' -f3 | sed 's/MB//')
+    local part_start=$(sudo parted -s "$target_device" unit MB print | grep "^ *${part_num}" | awk '{print $2}' | sed 's/MB//')
+    local current_end=$(sudo parted -s "$target_device" unit MB print | grep "^ *${part_num}" | awk '{print $3}' | sed 's/MB//')
+
+    echo
+    echo "Current partition:"
+    echo "  Start: ${part_start}MB"
+    echo "  End: ${current_end}MB"
+    echo "Maximum available end point: ${disk_end}MB"
+    echo
+    echo "How would you like to resize the partition?"
+    echo "1. Use all available space (extend to end of disk)"
+    echo "2. Specify custom end point in MB"
+    read -p "Enter your choice (1/2): " size_choice
+
+    local new_end
+    case $size_choice in
+        1)
+            new_end=$disk_end
+            ;;
+        2)
+            while true; do
+                read -p "Enter desired end point in MB (between ${current_end} and ${disk_end}MB): " custom_end
+                if [[ "$custom_end" =~ ^[0-9]+$ ]] && [ "$custom_end" -gt "$current_end" ] && [ "$custom_end" -le "$disk_end" ]; then
+                    new_end=$custom_end
+                    break
+                else
+                    echo "Invalid end point. Please enter a number between ${current_end} and ${disk_end}"
+                fi
+            done
+            ;;
+        *)
+            echo "Invalid choice"
+            return 1
+            ;;
+    esac
+
+    echo "This will expand partition $part_num to end at ${new_end}MB on $target_device"
     read -p "Continue? (y/n): " confirm
     if [ "$confirm" != "y" ]; then
         return 0
     fi
 
-    echo "Expanding partition..."
+    echo "Resizing partition..."
     echo "Command to execute:"
-    echo "  sudo growpart $target_device $part_num"
-    if ! sudo growpart "$target_device" "$part_num"; then
+    echo "  sudo parted $target_device resizepart $part_num ${new_end}MB"
+    if ! sudo parted "$target_device" resizepart "$part_num" "${new_end}MB"; then
         echo "Error: Failed to expand partition"
         return 1
     fi
@@ -422,7 +513,6 @@ expand_partition() {
     # if device name ends with a number, add a 'p' to the partition number
     # sda partition 1 -> sda1
     # nvme0n1 partition 1 -> nvme0n1p1
-
     local partition
     if [[ "$target_device" =~ [0-9]$ ]]; then
         partition="${target_device}p${part_num}"
